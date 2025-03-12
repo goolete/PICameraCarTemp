@@ -15,5 +15,13 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 # 添加可执行文件
 add_executable(PICameraCarTemp main.cpp)
 
+# 查找并链接 pigpio 库
+find_library(PIGPIO_LIBRARY pigpio)
+if(PIGPIO_LIBRARY)
+    target_link_libraries(PICameraCarTemp ${PIGPIO_LIBRARY} )
+else()
+    message(FATAL_ERROR "pigpio library not found.")
+endif()
+
 # 链接 OpenCV 库
 target_link_libraries(PICameraCarTemp ${OpenCV_LIBS})

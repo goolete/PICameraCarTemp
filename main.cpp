@@ -6,6 +6,7 @@
 #include <termios.h>
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
+#include <pigpio.h>
 
 // Use the cv and httplib namespaces to simplify code writing
 using namespace cv;
@@ -22,6 +23,52 @@ int serialFd;
 bool carRunStatus = false;
 // Variable to store the previous running status of the car
 bool precarRunStatus = false;
+// Define GPIO pins
+const int PIN_17 = 17;
+const int PIN_27 = 27;
+
+// Define the PWM frequency (unit: Hz)
+const int PWM_FREQUENCY = 80000;
+
+// Initialize GPIO and PWM
+void initPWM() {
+    if (gpioInitialise() < 0) {
+        std::cerr << "Failed to initialize pigpio library." << std::endl;
+        exit(1);
+    }
+
+    // Set the pins to output mode
+    gpioSetMode(PIN_17, PI_OUTPUT);
+    gpioSetMode(PIN_27, PI_OUTPUT);
+
+    // Set the PWM frequency
+    gpioSetPWMfrequency(PIN_17, PWM_FREQUENCY);
+    gpioSetPWMfrequency(PIN_27, PWM_FREQUENCY);
+
+    // Set the PWM range from 0 to 1000
+    gpioSetPWMrange(PIN_17, 1000);
+    gpioSetPWMrange(PIN_27, 1000);
+}
+
+// Set the PWM duty cycle for a specified pin
+void setPWM_DutyCycle(int pin, double dutyCycle) {
+    if (dutyCycle < 0.0) {
+        dutyCycle = 0.0;
+    } else if (dutyCycle > 1.0) {
+        dutyCycle = 1.0;
+    }
+
+    // Convert the duty cycle from 0 - 1 to 0 - 1000
+    int pwmValue = static_cast<int>(dutyCycle * 1000);
+    gpioPWM(pin, pwmValue);
+}
+
+// Clean up GPIO resources
+void cleanup() {
+    gpioPWM(PIN_17, 0);
+    gpioPWM(PIN_27, 0);
+    gpioTerminate();
+}
 
 // Calculate the center of gravity of the line
 cv::Point getLineCenter(const cv::Mat &binary) {
@@ -139,7 +186,7 @@ void car_stop() {
 // Timer handler function
 void timer_handler(const boost::system::error_code & /*e*/,
                    boost::asio::steady_timer *timer) {
-    std::cout << "Timer triggered, current time: " << std::chrono::steady_clock::now().time_since_epoch().count() << std::endl;
+    // std::cout << "Timer triggered, current time: " << std::chrono::steady_clock::now().time_since_epoch().count() << std::endl;
 
     // Check if the running status of the car has changed
     if (carRunStatus != precarRunStatus) {
@@ -292,6 +339,25 @@ void capture_frames() {
     }
 }
 
+void temp_control() {
+    initPWM();
+    for (double dutyCycle = 0.0; dutyCycle <= 0.88; dutyCycle += 0.01) {
+        std::cout << "Setting duty cycle to " << dutyCycle << " for both pins." << std::endl;
+        setPWM_DutyCycle(PIN_17, dutyCycle);
+        setPWM_DutyCycle(PIN_27, dutyCycle);
+        time_sleep(1);
+    }
+
+    for (double dutyCycle = 0.8; dutyCycle >= 0.0; dutyCycle -= 0.01) {
+        std::cout << "Setting duty cycle to " << dutyCycle << " for both pins." << std::endl;
+        setPWM_DutyCycle(PIN_17, dutyCycle);
+        setPWM_DutyCycle(PIN_27, dutyCycle);
+        time_sleep(1);
+    }
+
+    cleanup();
+}
+
 // Function to generate video streams
 std::string generate_frames() {
     if (latest_frame.empty()) {
@@ -316,6 +382,9 @@ int main(void) {
     std::thread capture_thread(capture_frames);
     // Detach the thread so that it can run independently
     capture_thread.detach();
+
+    std::thread temp_control_thread(temp_control);
+    temp_control_thread.detach();
 
     Server svr;
 
