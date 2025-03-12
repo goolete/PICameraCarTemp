@@ -16,6 +16,33 @@ Mat latest_frame;
 // Open the default camera (index 0)
 VideoCapture cap(0);
 
+// Find the centerline contour points of the trajectory line
+std::vector<cv::Point> findCenterlinePoints(const cv::Mat &binary, const std::vector<cv::Point> &contour) {
+    std::vector<cv::Point> centerlinePoints;
+    // Calculate the bounding rectangle of the contour
+    cv::Rect boundingRect = cv::boundingRect(contour);
+    for (int y = boundingRect.y; y < boundingRect.y + boundingRect.height; ++y) {
+        // Get a single row of the binary image
+        cv::Mat row = binary.row(y);
+        // Calculate the moments of the row
+        cv::Moments m = cv::moments(row, true);
+        if (m.m00 != 0) {
+            // If the zero - order moment is not zero, calculate the center x - coordinate of the row
+            int centerX = static_cast<int>(m.m10 / m.m00);
+            centerlinePoints.emplace_back(centerX, y);
+        }
+    }
+    return centerlinePoints;
+}
+
+// Draw the centerline contour on the color image
+void drawCenterlineOnColorImage(cv::Mat &colorImage, const std::vector<cv::Point> &centerlinePoints) {
+    for (size_t i = 0; i < centerlinePoints.size() - 1; ++i) {
+        // Draw a line between adjacent centerline points
+        cv::line(colorImage, centerlinePoints[i], centerlinePoints[i + 1], cv::Scalar(0, 255, 0), 2);
+    }
+}
+
 // Timer handler function
 void timer_handler(const boost::system::error_code & /*e*/,
                    boost::asio::steady_timer *timer) {
@@ -26,6 +53,42 @@ void timer_handler(const boost::system::error_code & /*e*/,
     cap.read(frame);
 
     if (!frame.empty()) {
+        cv::Mat gray;
+        // Convert the frame to grayscale
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        // Color filtering to identify black lines
+        cv::Mat binary;
+        // Threshold the grayscale image to get a binary image
+        threshold(gray, binary, 50, 255, THRESH_BINARY_INV);
+
+        // Morphological operations
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        // Perform an opening operation to remove small noise
+        cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+        // Perform a closing operation to connect broken trajectories
+        cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+
+        // Contour detection
+        std::vector<std::vector<cv::Point> > contours;
+        std::vector<cv::Vec4i> hierarchy;
+        // Find contours in the binary image
+        cv::findContours(binary, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        // Select the trajectory
+        std::vector<cv::Point> selectedContour;
+        for (const auto &contour: contours) {
+            double area = cv::contourArea(contour);
+            if (area > 100) {
+                // Select the contour with an area greater than 100
+                selectedContour = contour;
+                break;
+            }
+        }
+        // Update the latest frame
+        latest_frame = frame.clone();
+    } else {
+        // If the frame is empty, use the original frame
         latest_frame = frame.clone();
     }
 
@@ -39,7 +102,6 @@ void timer_handler(const boost::system::error_code & /*e*/,
 
 // Thread function to capture camera frames
 void capture_frames() {
-
     if (!cap.isOpened()) {
         std::cerr << "Failed to open camera" << std::endl;
         return;
@@ -82,6 +144,10 @@ std::string generate_frames() {
 }
 
 int main(void) {
+    // Start the thread to capture camera frames
+    std::thread capture_thread(capture_frames);
+    // Detach the thread so that it can run independently
+    capture_thread.detach();
 
     Server svr;
 
