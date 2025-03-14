@@ -5,12 +5,22 @@
 #include "libs/json.hpp"
 #include <termios.h>
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 #include <pigpio.h>
+#include <linux/i2c-dev.h>
+
+// 从设备I2C地址
+#define I2C_ADDR 0x5b
+// 温度高8位寄存器地址
+unsigned char TEMP_HIGH_REG = 0x04;
+// 温度低8位寄存器地址
+unsigned char TEMP_LOW_REG = 0x05;
+
 
 // Use the cv and httplib namespaces to simplify code writing
 using namespace cv;
 using namespace httplib;
+using namespace boost::placeholders;
 
 // Global variable to store the latest frame
 Mat latest_frame;
@@ -18,6 +28,17 @@ Mat latest_frame;
 VideoCapture cap(0);
 // File descriptor for the serial port
 int serialFd;
+int file;
+
+// 定义帧长度
+const int FRAME_LENGTH = 15;
+// 定义帧头
+const unsigned char FRAME_HEADER_1 = 0x5a;
+const unsigned char FRAME_HEADER_2 = 0x5a;
+// 足够大的缓冲区来存储拼接的数据
+char buffer_data[FRAME_LENGTH * 2];
+// 当前 buffer_data 中有效数据的长度
+size_t buffer_data_length = 0;
 
 // New boolean flag to indicate the running status of the car
 bool carRunStatus = false;
@@ -26,17 +47,15 @@ bool precarRunStatus = false;
 // Define GPIO pins
 const int PIN_17 = 17;
 const int PIN_27 = 27;
+// 定义 Trig 和 Echo 引脚的 BCM 编码
+const int TRIG_PIN = 19;
+const int ECHO_PIN = 26;
 
 // Define the PWM frequency (unit: Hz)
 const int PWM_FREQUENCY = 80000;
 
 // Initialize GPIO and PWM
 void initPWM() {
-    if (gpioInitialise() < 0) {
-        std::cerr << "Failed to initialize pigpio library." << std::endl;
-        exit(1);
-    }
-
     // Set the pins to output mode
     gpioSetMode(PIN_17, PI_OUTPUT);
     gpioSetMode(PIN_27, PI_OUTPUT);
@@ -48,6 +67,82 @@ void initPWM() {
     // Set the PWM range from 0 to 1000
     gpioSetPWMrange(PIN_17, 1000);
     gpioSetPWMrange(PIN_27, 1000);
+}
+
+void initmeasureDistance() {
+    if (gpioInitialise() < 0) {
+        std::cerr << "Failed to initialize pigpio library." << std::endl;
+        exit(1);
+    }
+
+    // 设置 Trig 引脚为输出模式，Echo 引脚为输入模式
+    gpioSetMode(TRIG_PIN, PI_OUTPUT);
+    gpioSetMode(ECHO_PIN, PI_INPUT);
+}
+
+// 该函数用于删除 char[] 数组的前 n 个元素
+void removeFirstNChars(char arr[], size_t arrSize, size_t n) {
+    // 将后面的元素向前移动 n 个位置
+    for (size_t i = 0; i < arrSize - n; ++i) {
+        arr[i] = arr[i + n];
+    }
+}
+
+void inittemp() {
+    // 打开I2C设备文件
+    if ((file = open("/dev/i2c-1", O_RDWR)) < 0) {
+        std::cerr << "Failed to open the i2c bus" << std::endl;
+    }
+
+    // 设置从设备地址
+    if (ioctl(file, I2C_SLAVE, I2C_ADDR) < 0) {
+        std::cerr << "Failed to acquire bus access and/or talk to slave" << std::endl;
+        close(file);
+    }
+}
+
+float get_temp() {
+    // 读取温度高8位数据
+    if (write(file, &TEMP_HIGH_REG, 1) != 1) {
+        std::cerr << "Failed to write to the i2c bus" << std::endl;
+        close(file);
+    }
+    unsigned char temp_high;
+    if (read(file, &temp_high, 1) != 1) {
+        std::cerr << "Failed to read from the i2c bus" << std::endl;
+        close(file);
+    }
+
+    // 读取温度低8位数据
+    if (write(file, &TEMP_LOW_REG, 1) != 1) {
+        std::cerr << "Failed to write to the i2c bus" << std::endl;
+        close(file);
+    }
+    unsigned char temp_low;
+    if (read(file, &temp_low, 1) != 1) {
+        std::cerr << "Failed to read from the i2c bus" << std::endl;
+        close(file);
+    }
+
+    // 合并高8位和低8位数据
+    unsigned short temp_raw = (temp_high << 8) | temp_low;
+
+    // 这里假设温度数据的转换公式，具体根据传感器手册调整
+    float temperature = (float)temp_raw / 100.0;
+
+    std::cout << "Temperature: " << temperature << " °C" << std::endl;
+
+    return temperature;
+}
+
+
+void init() {
+    if (gpioInitialise() < 0) {
+        std::cerr << "Failed to initialize pigpio library." << std::endl;
+    }
+    initPWM();
+    initmeasureDistance();
+    inittemp();
 }
 
 // Set the PWM duty cycle for a specified pin
@@ -69,6 +164,37 @@ void cleanup() {
     gpioPWM(PIN_27, 0);
     gpioTerminate();
 }
+
+// 测距函数
+float measureDistance() {
+    // 触发传感器
+    gpioWrite(TRIG_PIN, 0);
+    usleep(2);
+    gpioWrite(TRIG_PIN, 1);
+    usleep(10);
+    gpioWrite(TRIG_PIN, 0);
+
+    // 等待回声信号开始
+    uint32_t startTime;
+    while (gpioRead(ECHO_PIN) == 0) {
+        startTime = gpioTick();
+    }
+
+    // 等待回声信号结束
+    uint32_t endTime;
+    while (gpioRead(ECHO_PIN) == 1) {
+        endTime = gpioTick();
+    }
+
+    // 计算回声信号的持续时间
+    uint32_t duration = endTime - startTime;
+
+    // 计算距离（单位：厘米）
+    float distance = duration * 0.0343 / 2;
+
+    return distance;
+}
+
 
 // Calculate the center of gravity of the line
 cv::Point getLineCenter(const cv::Mat &binary) {
@@ -319,7 +445,6 @@ void capture_frames() {
 
     if (!cap.isOpened()) {
         std::cerr << "Failed to open camera" << std::endl;
-        return;
     }
 
     try {
@@ -340,7 +465,6 @@ void capture_frames() {
 }
 
 void temp_control() {
-    initPWM();
     for (double dutyCycle = 0.0; dutyCycle <= 0.88; dutyCycle += 0.01) {
         std::cout << "Setting duty cycle to " << dutyCycle << " for both pins." << std::endl;
         setPWM_DutyCycle(PIN_17, dutyCycle);
@@ -377,7 +501,40 @@ std::string generate_frames() {
     return ss.str();
 }
 
+void timer1_handler(const boost::system::error_code & /*e*/,
+                    boost::asio::steady_timer *timer1) {
+    float distance = measureDistance();
+    // std::cout << "Distance: " << distance << " cm" << std::endl;
+
+    // Reset the timer to trigger again after 30 milliseconds
+    timer1->expires_at(timer1->expiry() + boost::asio::chrono::milliseconds(600));
+    // Asynchronously wait for the timer to expire and call the timer_handler function
+    timer1->async_wait(boost::bind(timer1_handler,
+                                   boost::asio::placeholders::error,
+                                   timer1));
+}
+
+void get_distance() {
+    try {
+        // Create an io_context object to handle asynchronous operations
+        boost::asio::io_context io_context1;
+        // Create a steady_timer object, initially set to trigger after 30 milliseconds
+        boost::asio::steady_timer timer1(io_context1, boost::asio::chrono::milliseconds(600));
+
+        // Asynchronously wait for the timer to expire and call the timer_handler function
+        timer1.async_wait(boost::bind(timer1_handler,
+                                      boost::asio::placeholders::error,
+                                      &timer1));
+        // Start the event loop to handle asynchronous operations
+        io_context1.run();
+    } catch (std::exception &e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
+    }
+}
+
 int main(void) {
+    init();
+
     // Start the thread to capture camera frames
     std::thread capture_thread(capture_frames);
     // Detach the thread so that it can run independently
@@ -385,6 +542,9 @@ int main(void) {
 
     std::thread temp_control_thread(temp_control);
     temp_control_thread.detach();
+
+    std::thread distance_thread(get_distance);
+    distance_thread.detach();
 
     Server svr;
 
