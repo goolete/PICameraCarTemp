@@ -9,13 +9,12 @@
 #include <pigpio.h>
 #include <linux/i2c-dev.h>
 
-// 从设备I2C地址
+// I2C address of the slave device
 #define I2C_ADDR 0x5b
-// 温度高8位寄存器地址
+// Register address for the high 8 bits of temperature
 unsigned char TEMP_HIGH_REG = 0x04;
-// 温度低8位寄存器地址
+// Register address for the low 8 bits of temperature
 unsigned char TEMP_LOW_REG = 0x05;
-
 
 // Use the cv and httplib namespaces to simplify code writing
 using namespace cv;
@@ -30,14 +29,14 @@ VideoCapture cap(0);
 int serialFd;
 int file;
 
-// 定义帧长度
+// Define the frame length
 const int FRAME_LENGTH = 15;
-// 定义帧头
+// Define the frame headers
 const unsigned char FRAME_HEADER_1 = 0x5a;
 const unsigned char FRAME_HEADER_2 = 0x5a;
-// 足够大的缓冲区来存储拼接的数据
+// A large enough buffer to store the concatenated data
 char buffer_data[FRAME_LENGTH * 2];
-// 当前 buffer_data 中有效数据的长度
+// The length of valid data in the current buffer_data
 size_t buffer_data_length = 0;
 
 // New boolean flag to indicate the running status of the car
@@ -47,9 +46,21 @@ bool precarRunStatus = false;
 // Define GPIO pins
 const int PIN_17 = 17;
 const int PIN_27 = 27;
-// 定义 Trig 和 Echo 引脚的 BCM 编码
+// Define the BCM codes for Trig and Echo pins
 const int TRIG_PIN = 19;
 const int ECHO_PIN = 26;
+
+double setpoint = 25.0; // Target temperature
+float distance = 0;
+
+// 定义状态机的状态
+enum CarState {
+    STATE_LINE_FOLLOWING,  // 巡线状态
+    STATE_OBSTACLE_AVOIDANCE,  // 避障状态
+    STATE_STOPPED  // 停止状态
+};
+
+CarState currentState = STATE_STOPPED;
 
 // Define the PWM frequency (unit: Hz)
 const int PWM_FREQUENCY = 80000;
@@ -75,26 +86,26 @@ void initmeasureDistance() {
         exit(1);
     }
 
-    // 设置 Trig 引脚为输出模式，Echo 引脚为输入模式
+    // Set the Trig pin as an output mode and the Echo pin as an input mode
     gpioSetMode(TRIG_PIN, PI_OUTPUT);
     gpioSetMode(ECHO_PIN, PI_INPUT);
 }
 
-// 该函数用于删除 char[] 数组的前 n 个元素
+// This function is used to remove the first n elements from a char[] array
 void removeFirstNChars(char arr[], size_t arrSize, size_t n) {
-    // 将后面的元素向前移动 n 个位置
+    // Move the following elements forward by n positions
     for (size_t i = 0; i < arrSize - n; ++i) {
         arr[i] = arr[i + n];
     }
 }
 
 void inittemp() {
-    // 打开I2C设备文件
+    // Open the I2C device file
     if ((file = open("/dev/i2c-1", O_RDWR)) < 0) {
         std::cerr << "Failed to open the i2c bus" << std::endl;
     }
 
-    // 设置从设备地址
+    // Set the slave device address
     if (ioctl(file, I2C_SLAVE, I2C_ADDR) < 0) {
         std::cerr << "Failed to acquire bus access and/or talk to slave" << std::endl;
         close(file);
@@ -102,7 +113,7 @@ void inittemp() {
 }
 
 float get_temp() {
-    // 读取温度高8位数据
+    // Read the high 8 bits of temperature data
     if (write(file, &TEMP_HIGH_REG, 1) != 1) {
         std::cerr << "Failed to write to the i2c bus" << std::endl;
         close(file);
@@ -113,7 +124,7 @@ float get_temp() {
         close(file);
     }
 
-    // 读取温度低8位数据
+    // Read the low 8 bits of temperature data
     if (write(file, &TEMP_LOW_REG, 1) != 1) {
         std::cerr << "Failed to write to the i2c bus" << std::endl;
         close(file);
@@ -124,13 +135,13 @@ float get_temp() {
         close(file);
     }
 
-    // 合并高8位和低8位数据
+    // Combine the high 8 bits and low 8 bits of data
     unsigned short temp_raw = (temp_high << 8) | temp_low;
 
-    // 这里假设温度数据的转换公式，具体根据传感器手册调整
-    float temperature = (float)temp_raw / 100.0;
+    // Here is the assumed temperature data conversion formula, which needs to be adjusted according to the sensor manual
+    float temperature = (float) temp_raw / 100.0;
 
-    std::cout << "Temperature: " << temperature << " °C" << std::endl;
+    // std::cout << "Temperature: " << temperature << " °C" << std::endl;
 
     return temperature;
 }
@@ -165,31 +176,31 @@ void cleanup() {
     gpioTerminate();
 }
 
-// 测距函数
+// Distance measurement function
 float measureDistance() {
-    // 触发传感器
+    // Trigger the sensor
     gpioWrite(TRIG_PIN, 0);
     usleep(2);
     gpioWrite(TRIG_PIN, 1);
     usleep(10);
     gpioWrite(TRIG_PIN, 0);
 
-    // 等待回声信号开始
+    // Wait for the echo signal to start
     uint32_t startTime;
     while (gpioRead(ECHO_PIN) == 0) {
         startTime = gpioTick();
     }
 
-    // 等待回声信号结束
+    // Wait for the echo signal to end
     uint32_t endTime;
     while (gpioRead(ECHO_PIN) == 1) {
         endTime = gpioTick();
     }
 
-    // 计算回声信号的持续时间
+    // Calculate the duration of the echo signal
     uint32_t duration = endTime - startTime;
 
-    // 计算距离（单位：厘米）
+    // Calculate the distance (unit: cm)
     float distance = duration * 0.0343 / 2;
 
     return distance;
@@ -309,6 +320,15 @@ void car_stop() {
     }
 }
 
+void car_turn_right() {
+    const char *message1 = "{#010P12000T0000!}";
+    // Write the message to the serial port
+    ssize_t bytesWritten = write(serialFd, message1, strlen(message1));
+    if (bytesWritten == -1) {
+        std::cerr << "Failed to send message via serial port" << std::endl;
+    }
+}
+
 // Timer handler function
 void timer_handler(const boost::system::error_code & /*e*/,
                    boost::asio::steady_timer *timer) {
@@ -319,9 +339,11 @@ void timer_handler(const boost::system::error_code & /*e*/,
         if (carRunStatus) {
             // If the car should run, call the car_run function
             car_run();
+            currentState = STATE_LINE_FOLLOWING;
         } else {
             // If the car should stop, call the car_stop function
             car_stop();
+            currentState = STATE_STOPPED;
         }
         // Update the previous running status
         precarRunStatus = carRunStatus;
@@ -334,69 +356,94 @@ void timer_handler(const boost::system::error_code & /*e*/,
     if (!frame.empty()) {
         // Check the running status of the car
         if (carRunStatus) {
-            cv::Mat gray;
-            // Convert the frame to grayscale
-            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+            switch (currentState) {
+                case STATE_LINE_FOLLOWING: {
+                    // 检查距离
+                    if (distance < 20) {  // 假设距离小于20cm认为有障碍物
+                        car_stop();
+                        currentState = STATE_OBSTACLE_AVOIDANCE;
+                    } else {
+                        cv::Mat gray;
+                        // Convert the frame to grayscale
+                        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-            // Color filtering to identify black lines
-            cv::Mat binary;
-            // Threshold the grayscale image to get a binary image
-            threshold(gray, binary, 50, 255, THRESH_BINARY_INV);
+                        // Color filtering to identify black lines
+                        cv::Mat binary;
+                        // Threshold the grayscale image to get a binary image
+                        threshold(gray, binary, 50, 255, THRESH_BINARY_INV);
 
-            // Morphological operations
-            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-            // Perform an opening operation to remove small noise
-            cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
-            // Perform a closing operation to connect broken trajectories
-            cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+                        // Morphological operations
+                        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+                        // Perform an opening operation to remove small noise
+                        cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+                        // Perform a closing operation to connect broken trajectories
+                        cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
 
-            // Contour detection
-            std::vector<std::vector<cv::Point> > contours;
-            std::vector<cv::Vec4i> hierarchy;
-            // Find contours in the binary image
-            cv::findContours(binary, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                        // Contour detection
+                        std::vector<std::vector<cv::Point> > contours;
+                        std::vector<cv::Vec4i> hierarchy;
+                        // Find contours in the binary image
+                        cv::findContours(binary, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-            // Select the trajectory
-            std::vector<cv::Point> selectedContour;
-            for (const auto &contour: contours) {
-                double area = cv::contourArea(contour);
-                if (area > 100) {
-                    // Select the contour with an area greater than 100
-                    selectedContour = contour;
+                        // Select the trajectory
+                        std::vector<cv::Point> selectedContour;
+                        for (const auto &contour: contours) {
+                            double area = cv::contourArea(contour);
+                            if (area > 100) {
+                                // Select the contour with an area greater than 100
+                                selectedContour = contour;
+                                break;
+                            }
+                        }
+
+                        if (!selectedContour.empty()) {
+                            // Calculate the center of gravity of the line
+                            cv::Point center = getLineCenter(binary);
+
+                            // Generate control commands
+                            int command = generateControlCommand(center, binary.cols);
+                            const char *message_template = "{#010P%dT0000!}";
+                            char message[50];
+                            // Format the control command into a message
+                            snprintf(message, sizeof(message), message_template, command);
+                            // Write the message to the serial port
+                            ssize_t bytesWritten = write(serialFd, message, strlen(message));
+                            if (bytesWritten == -1) {
+                                std::cerr << "Failed to send message via serial port" << std::endl;
+                            }
+                            // std::cout << "Output: " << command << std::endl;
+                            // std::cout << "Concatenated message: " << message << std::endl;
+
+                            // Find the centerline contour points of the trajectory line
+                            std::vector<cv::Point> centerlinePoints = findCenterlinePoints(binary, selectedContour);
+
+                            // Draw the centerline contour on the color image
+                            cv::Mat colorImageWithCenterline = frame.clone();
+                            drawCenterlineOnColorImage(colorImageWithCenterline, centerlinePoints);
+
+                            // Update the latest frame
+                            latest_frame = colorImageWithCenterline.clone();
+                        } else {
+                            // If no contour is selected, use the original frame
+                            latest_frame = frame.clone();
+                        }
+                    }
                     break;
                 }
-            }
-
-            if (!selectedContour.empty()) {
-                // Calculate the center of gravity of the line
-                cv::Point center = getLineCenter(binary);
-
-                // Generate control commands
-                int command = generateControlCommand(center, binary.cols);
-                const char *message_template = "{#010P%dT0000!}";
-                char message[50];
-                // Format the control command into a message
-                snprintf(message, sizeof(message), message_template, command);
-                // Write the message to the serial port
-                ssize_t bytesWritten = write(serialFd, message, strlen(message));
-                if (bytesWritten == -1) {
-                    std::cerr << "Failed to send message via serial port" << std::endl;
+                case STATE_OBSTACLE_AVOIDANCE: {
+                    // 简单的避障策略：右转
+                    car_turn_right();
+                    if (distance > 20) {  // 假设距离大于20cm认为障碍物已避开
+                        car_run();
+                        currentState = STATE_LINE_FOLLOWING;
+                    }
+                    latest_frame = frame.clone();
+                    break;
                 }
-                // std::cout << "Output: " << command << std::endl;
-                // std::cout << "Concatenated message: " << message << std::endl;
-
-                // Find the centerline contour points of the trajectory line
-                std::vector<cv::Point> centerlinePoints = findCenterlinePoints(binary, selectedContour);
-
-                // Draw the centerline contour on the color image
-                cv::Mat colorImageWithCenterline = frame.clone();
-                drawCenterlineOnColorImage(colorImageWithCenterline, centerlinePoints);
-
-                // Update the latest frame
-                latest_frame = colorImageWithCenterline.clone();
-            } else {
-                // If no contour is selected, use the original frame
-                latest_frame = frame.clone();
+                case STATE_STOPPED: {
+                    latest_frame = frame.clone();
+                    break;
+                }
             }
         } else {
             // If the car is not running, use the original frame
@@ -464,22 +511,63 @@ void capture_frames() {
     }
 }
 
+void timer2_handler(const boost::system::error_code & /*e*/,
+                    boost::asio::steady_timer *timer2) {
+    // PID controller parameters
+    double kp = 1.0;
+    double ki = 0.1;
+    double kd = 0.01;
+
+    // PID controller related variables
+    static double integral = 0;
+    static double previous_error = 0;
+
+    double temp = get_temp();
+
+    // Calculate the PID output
+    double error = setpoint - temp;
+    integral += error;
+    double derivative = error - previous_error;
+    double pid_output = kp * error + ki * integral + kd * derivative;
+    previous_error = error;
+
+    // Control the cooling plate or heating plate according to the PID output
+    if (pid_output > 0) {
+        // Heating
+        double dutyCycle = std::min(1.0, std::max(0.0, pid_output));
+        setPWM_DutyCycle(27, dutyCycle);
+        setPWM_DutyCycle(17, 0.0); // Turn off the cooling plate
+    } else {
+        // Cooling
+        double dutyCycle = std::min(1.0, std::max(0.0, -pid_output));
+        setPWM_DutyCycle(17, dutyCycle);
+        setPWM_DutyCycle(27, 0.0); // Turn off the heating plate
+    }
+
+    // Reset the timer to trigger again after 200 milliseconds
+    timer2->expires_at(timer2->expiry() + boost::asio::chrono::milliseconds(200));
+    // Asynchronously wait for the timer to expire and call the timer_handler function
+    timer2->async_wait(boost::bind(timer2_handler,
+                                   boost::asio::placeholders::error,
+                                   timer2));
+}
+
 void temp_control() {
-    for (double dutyCycle = 0.0; dutyCycle <= 0.88; dutyCycle += 0.01) {
-        std::cout << "Setting duty cycle to " << dutyCycle << " for both pins." << std::endl;
-        setPWM_DutyCycle(PIN_17, dutyCycle);
-        setPWM_DutyCycle(PIN_27, dutyCycle);
-        time_sleep(1);
-    }
+    try {
+        // Create an io_context object to handle asynchronous operations
+        boost::asio::io_context io_context1;
+        // Create a steady_timer object, initially set to trigger after 200 milliseconds
+        boost::asio::steady_timer timer2(io_context1, boost::asio::chrono::milliseconds(200));
 
-    for (double dutyCycle = 0.8; dutyCycle >= 0.0; dutyCycle -= 0.01) {
-        std::cout << "Setting duty cycle to " << dutyCycle << " for both pins." << std::endl;
-        setPWM_DutyCycle(PIN_17, dutyCycle);
-        setPWM_DutyCycle(PIN_27, dutyCycle);
-        time_sleep(1);
+        // Asynchronously wait for the timer to expire and call the timer_handler function
+        timer2.async_wait(boost::bind(timer2_handler,
+                                      boost::asio::placeholders::error,
+                                      &timer2));
+        // Start the event loop to handle asynchronous operations
+        io_context1.run();
+    } catch (std::exception &e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
     }
-
-    cleanup();
 }
 
 // Function to generate video streams
@@ -503,11 +591,11 @@ std::string generate_frames() {
 
 void timer1_handler(const boost::system::error_code & /*e*/,
                     boost::asio::steady_timer *timer1) {
-    float distance = measureDistance();
-    // std::cout << "Distance: " << distance << " cm" << std::endl;
+    distance = measureDistance();
+    std::cout << "Distance: " << distance << " cm" << std::endl;
 
-    // Reset the timer to trigger again after 30 milliseconds
-    timer1->expires_at(timer1->expiry() + boost::asio::chrono::milliseconds(600));
+    // Reset the timer to trigger again after 600 milliseconds
+    timer1->expires_at(timer1->expiry() + boost::asio::chrono::milliseconds(100));
     // Asynchronously wait for the timer to expire and call the timer_handler function
     timer1->async_wait(boost::bind(timer1_handler,
                                    boost::asio::placeholders::error,
@@ -518,7 +606,7 @@ void get_distance() {
     try {
         // Create an io_context object to handle asynchronous operations
         boost::asio::io_context io_context1;
-        // Create a steady_timer object, initially set to trigger after 30 milliseconds
+        // Create a steady_timer object, initially set to trigger after 600 milliseconds
         boost::asio::steady_timer timer1(io_context1, boost::asio::chrono::milliseconds(600));
 
         // Asynchronously wait for the timer to expire and call the timer_handler function
