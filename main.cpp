@@ -1,3 +1,4 @@
+#include <fstream>
 #include <iostream>
 #include <thread>
 #include <opencv2/opencv.hpp>
@@ -53,11 +54,16 @@ const int ECHO_PIN = 26;
 double setpoint = 25.0; // Target temperature
 float distance = 0;
 
-// 定义状态机的状态
+// Added global variables to record time and status
+std::chrono::steady_clock::time_point turn_start_time;
+bool is_turning_right = false;
+bool is_turning_left = false;
+
+// Define the state of the state machine
 enum CarState {
-    STATE_LINE_FOLLOWING,  // 巡线状态
-    STATE_OBSTACLE_AVOIDANCE,  // 避障状态
-    STATE_STOPPED  // 停止状态
+    STATE_LINE_FOLLOWING, // Line status
+    STATE_OBSTACLE_AVOIDANCE, // Obstacle avoidance state
+    STATE_STOPPED // Stop state
 };
 
 CarState currentState = STATE_STOPPED;
@@ -320,8 +326,17 @@ void car_stop() {
     }
 }
 
+void car_turn_left() {
+    const char *message1 = "{#010P1000T0000!}";
+    // Write the message to the serial port
+    ssize_t bytesWritten = write(serialFd, message1, strlen(message1));
+    if (bytesWritten == -1) {
+        std::cerr << "Failed to send message via serial port" << std::endl;
+    }
+}
+
 void car_turn_right() {
-    const char *message1 = "{#010P12000T0000!}";
+    const char *message1 = "{#010P2000T0000!}";
     // Write the message to the serial port
     ssize_t bytesWritten = write(serialFd, message1, strlen(message1));
     if (bytesWritten == -1) {
@@ -356,93 +371,116 @@ void timer_handler(const boost::system::error_code & /*e*/,
     if (!frame.empty()) {
         // Check the running status of the car
         if (carRunStatus) {
-            switch (currentState) {
-                case STATE_LINE_FOLLOWING: {
-                    // 检查距离
-                    if (distance < 20) {  // 假设距离小于20cm认为有障碍物
-                        car_stop();
-                        currentState = STATE_OBSTACLE_AVOIDANCE;
-                    } else {
-                        cv::Mat gray;
-                        // Convert the frame to grayscale
-                        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+            if (is_turning_right || is_turning_left) {
+                auto current_time = std::chrono::steady_clock::now();
+                auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    current_time - turn_start_time).count();
+                std::cout << elapsed_time << std::endl;
 
-                        // Color filtering to identify black lines
-                        cv::Mat binary;
-                        // Threshold the grayscale image to get a binary image
-                        threshold(gray, binary, 50, 255, THRESH_BINARY_INV);
-
-                        // Morphological operations
-                        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-                        // Perform an opening operation to remove small noise
-                        cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
-                        // Perform a closing operation to connect broken trajectories
-                        cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
-
-                        // Contour detection
-                        std::vector<std::vector<cv::Point> > contours;
-                        std::vector<cv::Vec4i> hierarchy;
-                        // Find contours in the binary image
-                        cv::findContours(binary, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-                        // Select the trajectory
-                        std::vector<cv::Point> selectedContour;
-                        for (const auto &contour: contours) {
-                            double area = cv::contourArea(contour);
-                            if (area > 100) {
-                                // Select the contour with an area greater than 100
-                                selectedContour = contour;
-                                break;
-                            }
-                        }
-
-                        if (!selectedContour.empty()) {
-                            // Calculate the center of gravity of the line
-                            cv::Point center = getLineCenter(binary);
-
-                            // Generate control commands
-                            int command = generateControlCommand(center, binary.cols);
-                            const char *message_template = "{#010P%dT0000!}";
-                            char message[50];
-                            // Format the control command into a message
-                            snprintf(message, sizeof(message), message_template, command);
-                            // Write the message to the serial port
-                            ssize_t bytesWritten = write(serialFd, message, strlen(message));
-                            if (bytesWritten == -1) {
-                                std::cerr << "Failed to send message via serial port" << std::endl;
-                            }
-                            // std::cout << "Output: " << command << std::endl;
-                            // std::cout << "Concatenated message: " << message << std::endl;
-
-                            // Find the centerline contour points of the trajectory line
-                            std::vector<cv::Point> centerlinePoints = findCenterlinePoints(binary, selectedContour);
-
-                            // Draw the centerline contour on the color image
-                            cv::Mat colorImageWithCenterline = frame.clone();
-                            drawCenterlineOnColorImage(colorImageWithCenterline, centerlinePoints);
-
-                            // Update the latest frame
-                            latest_frame = colorImageWithCenterline.clone();
-                        } else {
-                            // If no contour is selected, use the original frame
-                            latest_frame = frame.clone();
-                        }
+                if (is_turning_right) {
+                    if (elapsed_time >= 1000) {
+                        // Turn right for two seconds
+                        car_turn_left();
+                        is_turning_right = false;
+                        is_turning_left = true;
+                        turn_start_time = std::chrono::steady_clock::now();
                     }
-                    break;
-                }
-                case STATE_OBSTACLE_AVOIDANCE: {
-                    // 简单的避障策略：右转
-                    car_turn_right();
-                    if (distance > 20) {  // 假设距离大于20cm认为障碍物已避开
-                        car_run();
+                } else if (is_turning_left) {
+                    if (elapsed_time >= 1000) {
+                        // After two seconds left turn
+                        is_turning_left = false;
                         currentState = STATE_LINE_FOLLOWING;
                     }
-                    latest_frame = frame.clone();
-                    break;
                 }
-                case STATE_STOPPED: {
-                    latest_frame = frame.clone();
-                    break;
+                latest_frame = frame.clone();
+            } else {
+                switch (currentState) {
+                    case STATE_LINE_FOLLOWING: {
+                        // std::cout << distance << std::endl;
+                        // Check the distance
+                        if (distance < 35) {
+                            // An obstacle is considered if the distance is less than 20cm
+                            // car_stop();
+                            currentState = STATE_OBSTACLE_AVOIDANCE;
+                        } else {
+                            cv::Mat gray;
+                            // Convert the frame to grayscale
+                            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+                            // Color filtering to identify black lines
+                            cv::Mat binary;
+                            // Threshold the grayscale image to get a binary image
+                            threshold(gray, binary, 50, 255, THRESH_BINARY_INV);
+
+                            // Morphological operations
+                            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+                            // Perform an opening operation to remove small noise
+                            cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+                            // Perform a closing operation to connect broken trajectories
+                            cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+
+                            // Contour detection
+                            std::vector<std::vector<cv::Point> > contours;
+                            std::vector<cv::Vec4i> hierarchy;
+                            // Find contours in the binary image
+                            cv::findContours(binary, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+                            // Select the trajectory
+                            std::vector<cv::Point> selectedContour;
+                            for (const auto &contour: contours) {
+                                double area = cv::contourArea(contour);
+                                if (area > 100) {
+                                    // Select the contour with an area greater than 100
+                                    selectedContour = contour;
+                                    break;
+                                }
+                            }
+
+                            if (!selectedContour.empty()) {
+                                // Calculate the center of gravity of the line
+                                cv::Point center = getLineCenter(binary);
+
+                                // Generate control commands
+                                int command = generateControlCommand(center, binary.cols);
+                                const char *message_template = "{#010P%dT0000!}";
+                                char message[50];
+                                // Format the control command into a message
+                                snprintf(message, sizeof(message), message_template, command);
+                                // Write the message to the serial port
+                                ssize_t bytesWritten = write(serialFd, message, strlen(message));
+                                if (bytesWritten == -1) {
+                                    std::cerr << "Failed to send message via serial port" << std::endl;
+                                }
+                                // std::cout << "Output: " << command << std::endl;
+                                // std::cout << "Concatenated message: " << message << std::endl;
+
+                                // Find the centerline contour points of the trajectory line
+                                std::vector<cv::Point> centerlinePoints = findCenterlinePoints(binary, selectedContour);
+
+                                // Draw the centerline contour on the color image
+                                cv::Mat colorImageWithCenterline = frame.clone();
+                                drawCenterlineOnColorImage(colorImageWithCenterline, centerlinePoints);
+
+                                // Update the latest frame
+                                latest_frame = colorImageWithCenterline.clone();
+                            } else {
+                                // If no contour is selected, use the original frame
+                                latest_frame = frame.clone();
+                            }
+                        }
+                        break;
+                    }
+                    case STATE_OBSTACLE_AVOIDANCE: {
+                        car_turn_right();
+                        turn_start_time = std::chrono::steady_clock::now();
+                        is_turning_right = true;
+                        latest_frame = frame.clone();
+                        break;
+                    }
+                    case STATE_STOPPED: {
+                        latest_frame = frame.clone();
+                        break;
+                    }
                 }
             }
         } else {
@@ -465,7 +503,7 @@ void timer_handler(const boost::system::error_code & /*e*/,
 // Thread function to capture camera frames
 void capture_frames() {
     // Open the serial port device
-    serialFd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY);
+    serialFd = open("/dev/ttyUSB1", O_RDWR | O_NOCTTY | O_NDELAY);
     if (serialFd == -1) {
         std::cerr << "Failed to open serial port device" << std::endl;
     }
@@ -592,7 +630,7 @@ std::string generate_frames() {
 void timer1_handler(const boost::system::error_code & /*e*/,
                     boost::asio::steady_timer *timer1) {
     distance = measureDistance();
-    std::cout << "Distance: " << distance << " cm" << std::endl;
+    // std::cout << "Distance: " << distance << " cm" << std::endl;
 
     // Reset the timer to trigger again after 600 milliseconds
     timer1->expires_at(timer1->expiry() + boost::asio::chrono::milliseconds(100));
@@ -636,13 +674,33 @@ int main(void) {
 
     Server svr;
 
+    svr.set_base_dir("/home/pi/program/dist");
+
+    svr.Get("/", [](const Request &req, Response &res) {
+        try {
+            std::ifstream file("/home/pi/program/dist/index.html");
+            if (file.is_open()) {
+                std::stringstream buffer;
+                buffer << file.rdbuf();
+                std::string content = buffer.str();
+                res.set_content(content, "text/html");
+            } else {
+                res.status = 404;
+                res.set_content("File not found", "text/plain");
+            }
+        } catch (...) {
+            res.status = 500;
+            res.set_content("Internal server error", "text/plain");
+        }
+    });
+
     // Define a route to handle video stream requests
     svr.Get("/video_feed", [](const Request &req, Response &res) {
         res.set_content(generate_frames(), "multipart/x-mixed-replace; boundary=frame");
     });
 
     // New route to receive the switch status sent from the front - end
-    svr.Post("/curtainSwitch", [](const Request &req, Response &res) {
+    svr.Post("/api/curtainSwitch", [](const Request &req, Response &res) {
         try {
             // Parse the JSON data from the request body
             auto json = nlohmann::json::parse(req.body);
