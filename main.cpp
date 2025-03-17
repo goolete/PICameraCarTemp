@@ -503,7 +503,7 @@ void timer_handler(const boost::system::error_code & /*e*/,
 // Thread function to capture camera frames
 void capture_frames() {
     // Open the serial port device
-    serialFd = open("/dev/ttyUSB1", O_RDWR | O_NOCTTY | O_NDELAY);
+    serialFd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY);
     if (serialFd == -1) {
         std::cerr << "Failed to open serial port device" << std::endl;
     }
@@ -552,9 +552,9 @@ void capture_frames() {
 void timer2_handler(const boost::system::error_code & /*e*/,
                     boost::asio::steady_timer *timer2) {
     // PID controller parameters
-    double kp = 1.0;
-    double ki = 0.1;
-    double kd = 0.01;
+    double kp = 25;
+    double ki = 0;
+    double kd = 0;
 
     // PID controller related variables
     static double integral = 0;
@@ -569,18 +569,27 @@ void timer2_handler(const boost::system::error_code & /*e*/,
     double pid_output = kp * error + ki * integral + kd * derivative;
     previous_error = error;
 
-    // Control the cooling plate or heating plate according to the PID output
-    if (pid_output > 0) {
-        // Heating
-        double dutyCycle = std::min(1.0, std::max(0.0, pid_output));
-        setPWM_DutyCycle(27, dutyCycle);
-        setPWM_DutyCycle(17, 0.0); // Turn off the cooling plate
-    } else {
-        // Cooling
-        double dutyCycle = std::min(1.0, std::max(0.0, -pid_output));
-        setPWM_DutyCycle(17, dutyCycle);
-        setPWM_DutyCycle(27, 0.0); // Turn off the heating plate
+    if (std::abs(error) <= 0.4) {
+        // If the error is within the range, reset the integral term to avoid integral accumulation
+        integral = 0.0;
+        previous_error = 0.0;
+    }else {
+        // Control the cooling plate or heating plate according to the PID output
+        if (pid_output > 0) {
+            // Heating
+            double dutyCycle = std::min(1.0, std::max(0.0, pid_output));
+            setPWM_DutyCycle(27, dutyCycle);
+            setPWM_DutyCycle(17, 0.0); // Turn off the cooling plate
+        } else {
+            // Cooling
+            double dutyCycle = std::min(1.0, std::max(0.0, -pid_output));
+            setPWM_DutyCycle(17, dutyCycle);
+            setPWM_DutyCycle(27, 0.0); // Turn off the heating plate
+        }
     }
+
+
+
 
     // Reset the timer to trigger again after 200 milliseconds
     timer2->expires_at(timer2->expiry() + boost::asio::chrono::milliseconds(200));
@@ -710,6 +719,30 @@ int main(void) {
             res.set_content("Success", "text/plain");
         } catch (...) {
             res.set_content("Error", "text/plain");
+        }
+    });
+
+    // 处理温度数据请求
+    svr.Get("/api/temperature", [](const httplib::Request &, httplib::Response &res) {
+        double temperature = get_temp();
+        std::string json = "{\"temperature\": " + std::to_string(temperature) + "}";
+        res.set_content(json, "application/json");
+    });
+
+    svr.Get("/api/targetTemperature", [](const httplib::Request &, httplib::Response &res) {
+        std::string json = "{\"target\": " + std::to_string(setpoint) + "}";
+        res.set_content(json, "application/json");
+    });
+
+    // 处理目标温度更新请求
+    svr.Post("/api/targetTemperature", [](const httplib::Request &req, httplib::Response &res) {
+        try {
+            auto json = nlohmann::json::parse(req.body);
+            setpoint = json["target"].get<double>();
+            res.set_content("Success", "text/plain");
+        } catch (const std::exception &e) {
+            res.status = 400;
+            res.set_content("Invalid request", "text/plain");
         }
     });
 
